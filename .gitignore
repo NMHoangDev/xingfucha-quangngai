@@ -1,0 +1,21 @@
+node_modules/
+.next/
+coverage/
+.DS_Store
+*.log
+.env*
+hp-task-firebase-adminsdk-fbsvc-ee802f04c3.json
+
+# Key Google / service account (không lên git)
+storage/permission/xinfucha_ggsheet.json
+storage/permission/xinfucha__ggsheet.json
+
+# Phiên / session cục bộ — không đẩy lên git
+*.session
+*.sess
+.sessions/
+/sessions/
+
+# Playwright / tool auth session dump (nếu có)
+**/storageState.json
+.auth/
