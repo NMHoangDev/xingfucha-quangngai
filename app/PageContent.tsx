@@ -21,6 +21,7 @@ import logoWebp from "@/assets/logo.webp";
 import { REWARDS, type Reward } from "@/lib/rewards/rewards";
 import { selectWeightedReward } from "@/lib/rewards/reward.service";
 import { runWithCrossTabStorageLock } from "@/lib/spins/cross-tab-lock";
+import { initializeAutoReset } from "@/lib/auto-reset-vouchers";
 
 type UserInfo = { name: string; phone: string };
 type ActiveTab = "spin" | "rewards";
@@ -57,6 +58,13 @@ const CHANNEL_KEY = "xfc-spin-sync-v2";
 const WALLET_COOKIE = "xfc_wallet_summary";
 /** Không còn phân chi nhánh — giá trị cố định lưu kèm voucher trong ví (local). */
 const DEFAULT_PLAY_LOCATION = "chung";
+
+/** Hạn chót vòng quay: 28/06/2026 23:59:59 giờ VN (16:59:59Z). */
+const SPIN_DEADLINE_UTC = "2026-06-28T16:59:59.999Z";
+/** Hạn cuối dùng voucher: 12/07/2026 23:59:59 giờ VN (16:59:59Z).
+ *  Voucher dùng được ngay sau khi quay (voucherUsableFrom = spin time). */
+const VOUCHER_EXPIRES_UTC = "2026-07-12T16:59:59.999Z";
+const VOUCHER_EXPIRES_ISO = new Date(VOUCHER_EXPIRES_UTC).toISOString();
 
 const rewardVisuals: Record<
   number,
@@ -280,6 +288,9 @@ export default function PageContent() {
   const phoneRegex = /^(0|84)(3|5|7|8|9)([0-9]{8})$/;
 
   useEffect(() => {
+    // Auto-reset vouchers on app load if deployment version changed
+    initializeAutoReset();
+
     setWallet(
       readJson<WalletStore>(WALLET_KEY) ?? { items: [], updatedAt: "" },
     );
@@ -443,11 +454,15 @@ export default function PageContent() {
     [wallet.items],
   );
 
-  /** Giới hạn lượt quay theo localStorage + ngày lịch */
+  /** Giới hạn lượt quay theo localStorage + ngày lịch + hạn chót chương trình */
+  const isSpinPeriodOver =
+    typeof window !== "undefined"
+      ? new Date() >= new Date(SPIN_DEADLINE_UTC)
+      : false;
   const hasReachedSpinLimit =
     quota?.day === todayKey() &&
     quota.spinsUsedToday >= quota.maxSpinsToday;
-  const localSpinBlocked = hasReachedSpinLimit;
+  const localSpinBlocked = hasReachedSpinLimit || isSpinPeriodOver;
 
   const persistWallet = (nextWallet: WalletStore) => {
     setWallet(nextWallet);
@@ -536,65 +551,73 @@ export default function PageContent() {
         target: number;
         spinReward: SpinReward;
       };
-      const outcome = await runWithCrossTabStorageLock((): SpinOk | "limit" => {
-        const t = todayKey();
-        const rawQ = readJson<DailyQuotaStore>(DAILY_QUOTA_KEY);
-        const q: DailyQuotaStore =
-          rawQ && rawQ.day === t
-            ? {
-                day: t,
-                spinsUsedToday: Math.min(
-                  Math.max(0, Number(rawQ.spinsUsedToday ?? 0)),
-                  MAX_SPINS_PER_DAY,
-                ),
-                maxSpinsToday: MAX_SPINS_PER_DAY,
-                ...(rawQ.profileKey ? { profileKey: rawQ.profileKey } : {}),
-              }
-            : {
-                day: t,
-                spinsUsedToday: 0,
-                maxSpinsToday: MAX_SPINS_PER_DAY,
-              };
-        if (q.spinsUsedToday >= q.maxSpinsToday) {
-          persistQuota(q);
-          return "limit";
-        }
-        const { reward, index } = selectWeightedReward();
-        const now = new Date();
-        const expiresAt = new Date(now.getTime());
-        expiresAt.setMonth(expiresAt.getMonth() + 1);
-        const usableFromIso = now.toISOString();
-        const expiresIso = expiresAt.toISOString();
-        const voucherCode = generateLocalVoucherCode(
-          reward.code ?? String(reward.id),
-        );
-        const spinReward: SpinReward = {
-          ...reward,
-          voucherDelayMinutes: 0,
-          voucherUsableFrom: usableFromIso,
-          voucherExpiresAt: expiresIso,
-        };
-        const angle = 360 / REWARDS.length;
-        const extraSpins = 6 + Math.floor(Math.random() * 3);
-        const offset = (Math.random() - 0.5) * (angle * 0.42);
-        const target =
-          extraSpins * 360 + (360 - (index * angle + angle / 2)) + offset;
-        const receivedAt = now.toISOString();
-        const duration = 3000 + Math.floor(Math.random() * 800);
-        persistProfile({ name, phone });
-        addRewardToWallet(spinReward, receivedAt, {
-          voucherCode,
-          locationId: DEFAULT_PLAY_LOCATION,
-        });
-        persistQuota({
-          day: t,
-          spinsUsedToday: q.spinsUsedToday + 1,
-          maxSpinsToday: MAX_SPINS_PER_DAY,
-          profileKey: createProfileKey(name, phone),
-        });
-        return { duration, target, spinReward };
-      });
+      const outcome = await runWithCrossTabStorageLock(
+        (): SpinOk | "limit" | "ended" => {
+          const now = new Date();
+          if (now >= new Date(SPIN_DEADLINE_UTC)) {
+            return "ended";
+          }
+          const t = todayKey();
+          const rawQ = readJson<DailyQuotaStore>(DAILY_QUOTA_KEY);
+          const q: DailyQuotaStore =
+            rawQ && rawQ.day === t
+              ? {
+                  day: t,
+                  spinsUsedToday: Math.min(
+                    Math.max(0, Number(rawQ.spinsUsedToday ?? 0)),
+                    MAX_SPINS_PER_DAY,
+                  ),
+                  maxSpinsToday: MAX_SPINS_PER_DAY,
+                  ...(rawQ.profileKey ? { profileKey: rawQ.profileKey } : {}),
+                }
+              : {
+                  day: t,
+                  spinsUsedToday: 0,
+                  maxSpinsToday: MAX_SPINS_PER_DAY,
+                };
+          if (q.spinsUsedToday >= q.maxSpinsToday) {
+            persistQuota(q);
+            return "limit";
+          }
+          const { reward, index } = selectWeightedReward();
+          // Voucher dùng được ngay sau khi quay, hết hạn cố định 12/07/2026.
+          const usableFromIso = now.toISOString();
+          const expiresIso = VOUCHER_EXPIRES_ISO;
+          const voucherCode = generateLocalVoucherCode(
+            reward.code ?? String(reward.id),
+          );
+          const spinReward: SpinReward = {
+            ...reward,
+            voucherDelayMinutes: 0,
+            voucherUsableFrom: usableFromIso,
+            voucherExpiresAt: expiresIso,
+          };
+          const angle = 360 / REWARDS.length;
+          const extraSpins = 6 + Math.floor(Math.random() * 3);
+          const offset = (Math.random() - 0.5) * (angle * 0.42);
+          const target =
+            extraSpins * 360 + (360 - (index * angle + angle / 2)) + offset;
+          const receivedAt = now.toISOString();
+          const duration = 3000 + Math.floor(Math.random() * 800);
+          persistProfile({ name, phone });
+          addRewardToWallet(spinReward, receivedAt, {
+            voucherCode,
+            locationId: DEFAULT_PLAY_LOCATION,
+          });
+          persistQuota({
+            day: t,
+            spinsUsedToday: q.spinsUsedToday + 1,
+            maxSpinsToday: MAX_SPINS_PER_DAY,
+            profileKey: createProfileKey(name, phone),
+          });
+          return { duration, target, spinReward };
+        },
+      );
 
+      if (outcome === "ended") {
+        setFormError("Chương trình quay thưởng đã kết thúc.");
+        return;
+      }
       if (outcome === "limit") {
         setFormError(
           `Đã dùng hết ${MAX_SPINS_PER_DAY} lượt quay hôm nay cho thiết bị này.`,
@@ -1010,9 +1033,11 @@ export default function PageContent() {
               >
                 {isSpinning
                   ? "Đang quay..."
-                  : hasReachedSpinLimit
-                    ? "Đã hết lượt quay hôm nay"
-                    : "Quay ngay"}
+                  : isSpinPeriodOver
+                    ? "Chương trình đã kết thúc"
+                    : hasReachedSpinLimit
+                      ? "Đã hết lượt quay hôm nay"
+                      : "Quay ngay"}
               </button>
 
               {formError && (
@@ -1036,8 +1061,9 @@ export default function PageContent() {
                 >
                   <div className="space-y-3 text-sm font-semibold leading-6 text-[#6c1a1f] bg-white p-2 rounded-xl">
                     <p>
-                      Voucher có thể dùng ngay sau khi trúng, hết hạn sau 1
-                      tháng và mỗi ngày dùng tối đa 3 voucher.
+                      Voucher có thể dùng ngay sau khi trúng, hạn sử dụng đến
+                      ngày 12/07/2026 và mỗi ngày dùng tối đa 3 voucher. Vòng
+                      quay đóng sau 23:59 ngày 28/06/2026.
                     </p>
                   </div>
                   <button
